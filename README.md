@@ -32,16 +32,18 @@ Go API Server
 └── Python modules → subprocess, JSON over stdin/stdout
 ```
 
-### Intermediate Representation (IR)
+### PTV Universal Format
 
-Every format module parses into and renders from this JSON structure:
+The PTV universal format is the project's native representation. Every record is explicitly typed — no field is ambiguous. Every record gets a unique `ptv_<uuid4>` identifier. The format is defined in Go at `internal/ir/record.go`.
 
 ```json
 {
+  "ptv_version": "1.0",
   "meta": {
     "source_format": "combolist_user_pass",
-    "source_name": "dump.txt",
-    "record_count": 3,
+    "source_file": "dump.txt",
+    "parsed_at": "2026-02-09T12:00:00Z",
+    "record_count": 2,
     "columns": ["email", "password"],
     "field_confidence": {
       "email": 0.95,
@@ -51,29 +53,95 @@ Every format module parses into and renders from this JSON structure:
   },
   "records": [
     {
-      "identifier": "user_or_email",
+      "ptv_id": "ptv_550e8400-e29b-41d4-a716-446655440000",
       "email": "user@example.com",
       "username": "someuser",
-      "password": "plaintext_or_null",
-      "hash": "$2b$10$...",
-      "salt": "abcdef",
-      "url": "https://example.com",
+      "phone": "+15555550100",
+      "name": "John Doe",
+      "password": "plaintext_if_known",
+      "hash": {
+        "type": "bcrypt",
+        "value": "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+      },
+      "salt": {
+        "value": "abcdef1234567890",
+        "encoding": "hex"
+      },
+      "url": "https://example.com/login",
+      "domain": "example.com",
       "ip": "192.168.1.1",
+      "port": 443,
       "extra": {
-        "phone": "555-0100",
-        "created_at": "2024-01-15",
-        "totp_secret": "JBSWY3DPEHPK3PXP"
+        "totp_secret": "JBSWY3DPEHPK3PXP",
+        "created_at": "2024-01-15"
       }
     }
   ]
 }
 ```
 
-**Field notes:**
-- `columns` — tracks which fields actually have data. A combolist only has `email` + `password`; an SQL dump might have all fields.
-- `field_confidence` — per-field accuracy map (0.0–1.0) indicating how confident the parser is that it correctly detected and mapped each field. For example, a combolist parser can't always distinguish `email` vs `username` without validation, so it might report `{"email": 0.9, "username": 0.6}`. A CSV with explicit headers would report `1.0` for all mapped fields.
-- `extra` — freeform map for format-specific fields that don't map to universal fields (e.g., TOTP secrets, phone numbers, creation dates). New fields can be added per-format via `extra` without changing the IR schema.
-- `identifier` — a fallback when the parser can't determine if a value is an email or username.
+#### Field rules
+
+**`ptv_id`** — every record gets `ptv_<uuid4>`. Generated on parse, persists through conversions. This is the universal record identifier across all PTV operations.
+
+**Identity fields:**
+| Field | Format | Rule |
+|-------|--------|------|
+| `email` | RFC 5322 | Must contain `@`. Only set when the parser is confident the value is an email. |
+| `username` | string | No `@` allowed. If the source is ambiguous (could be email or username), parsers should use `email` if it contains `@`, `username` otherwise. |
+| `phone` | `+<digits>` | **No spaces, dashes, parentheses, or symbols except the leading `+`.** Raw input like `(555) 555-0100` gets normalized to `+15555550100`. |
+| `name` | string | Display name / full name if available. |
+
+**Credential fields:**
+| Field | Format | Rule |
+|-------|--------|------|
+| `password` | string | Plaintext password, if known. |
+| `hash` | `{"type": "<algo>", "value": "<string>"}` | Hash value with its identified algorithm type. See hash types below. |
+| `salt` | `{"value": "<string>", "encoding": "<hex\|base64\|utf8\|raw>"}` | Salt with its encoding explicitly declared. |
+
+**Hash types** (auto-detected by `DetectHashType()`):
+
+| Type | Identified by |
+|------|---------------|
+| `bcrypt` | `$2a$`, `$2b$`, `$2y$` prefix |
+| `argon2id` | `$argon2id$` prefix |
+| `argon2i` | `$argon2i$` prefix |
+| `scrypt` | `$scrypt$` prefix |
+| `pbkdf2` | `$pbkdf2` prefix |
+| `sha512crypt` | `$6$` prefix |
+| `sha256crypt` | `$5$` prefix |
+| `md5crypt` | `$1$` prefix |
+| `apr1` | `$apr1$` prefix |
+| `sha1crypt` | `$sha1$` prefix |
+| `mysql` | `*` + 40 hex chars |
+| `md5` | 32 hex chars |
+| `sha1` | 40 hex chars |
+| `sha224` | 56 hex chars |
+| `sha256` | 64 hex chars |
+| `sha384` | 96 hex chars |
+| `sha512` | 128 hex chars |
+| `ntlm` | 32 hex chars (context-dependent, same length as MD5) |
+| `unknown` | Anything that doesn't match the above patterns |
+
+**Network fields:**
+| Field | Format | Rule |
+|-------|--------|------|
+| `url` | string | Full URL if available. |
+| `domain` | string | Domain extracted from URL, or standalone. |
+| `ip` | string | IPv4 or IPv6, no port. |
+| `port` | integer | Numeric, 1–65535. Zero means not set. |
+
+**`extra`** — freeform `map[string]any` for format-specific fields that don't map above (TOTP secrets, creation dates, group names, notes, etc.). This is how the format extends without schema changes.
+
+**Meta fields:**
+| Field | Purpose |
+|-------|---------|
+| `source_format` | Module name that produced this dataset. |
+| `source_file` | Original filename, if known. |
+| `parsed_at` | ISO 8601 timestamp of when parsing occurred. |
+| `record_count` | Number of records in the dataset. |
+| `columns` | Which Record fields actually have data (e.g., a combolist only populates `email` + `password`). |
+| `field_confidence` | Per-field map of 0.0–1.0 indicating parser confidence. A CSV with explicit headers reports `1.0` for all mapped fields. A combolist parser that can't distinguish email vs username might report `{"email": 0.9, "username": 0.6}`. |
 
 ### Easibility Scores
 
