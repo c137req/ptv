@@ -1,6 +1,5 @@
 # ptv
-
-parse the veil — universal data format conversion tool. converts between 83 data formats through a common intermediate representation.
+a universal data parsing daemon, binary, and RESTful API
 
 ```
 source.Parse(raw) → IR → target.Render(ir)
