@@ -1,5 +1,5 @@
 # ptv
-Parse The Veil is an all-around data parsing RESTful API. i love ptv
+Parse The Veil is a universal data parsing RESTful API. i love ptv
 
 ## Plan
 
