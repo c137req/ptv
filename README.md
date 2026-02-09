@@ -360,3 +360,14 @@ Python is used only where it has significantly better libraries:
 - Kerberos/GPG (specialized bindings)
 
 Python modules are standalone scripts. Go calls them via `os/exec`, piping IR JSON over stdin/stdout. Errors go to stderr. Non-zero exit = failure. Stateless and debuggable.
+
+### RESTful API
+
+A Go HTTP API will wrap the CLI conversion system. The core endpoints:
+
+```
+POST /convert       { "from": "<format>", "to": "<format>", "data": "..." }
+GET  /formats       list available format modules
+```
+
+The API reuses the same module registry and Parse/Render pipeline as the CLI — no separate logic. Security implementation (authentication, rate limiting, access control, etc.) will be specified and instructed by the project owner before being built.
