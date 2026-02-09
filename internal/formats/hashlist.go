@@ -12,18 +12,21 @@ type _hashlist_plain struct{}
 type _hashlist_user struct{}
 type _hashlist_salt struct{}
 type _jtr_pot struct{}
+type _hashcat_pot struct{}
 
 func init() {
 	module.Register(&_hashlist_plain{})
 	module.Register(&_hashlist_user{})
 	module.Register(&_hashlist_salt{})
 	module.Register(&_jtr_pot{})
+	module.Register(&_hashcat_pot{})
 }
 
 func (h *_hashlist_plain) Name() string { return "hashlist_plain" }
 func (h *_hashlist_user) Name() string  { return "hashlist_user_hash" }
 func (h *_hashlist_salt) Name() string  { return "hashlist_hash_salt" }
 func (h *_jtr_pot) Name() string        { return "jtr_pot" }
+func (h *_hashcat_pot) Name() string    { return "hashcat_pot" }
 
 func (h *_hashlist_plain) Parse(raw []byte) (*ir.Dataset, error) {
 	lines := _split_lines(string(raw))
@@ -191,6 +194,44 @@ func _guess_salt_encoding(s string) ir.SaltEncoding {
 		return ir.SaltHex
 	}
 	return ir.SaltUTF8
+}
+
+// hashcat pot: hash:plaintext — same as jtr but hashcat output may be identical
+func (h *_hashcat_pot) Parse(raw []byte) (*ir.Dataset, error) {
+	lines := _split_lines(string(raw))
+	records := make([]ir.Record, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		// hashcat pot format: hash:plaintext (split on last colon)
+		idx := strings.LastIndex(line, ":")
+		if idx < 0 {
+			continue
+		}
+		hash_val := line[:idx]
+		plain := line[idx+1:]
+		r := ir.Record{
+			PTVID:    ir.NewPTVID(),
+			Hash:     &ir.Hash{Type: ir.DetectHashType(hash_val), Value: hash_val},
+			Password: plain,
+		}
+		records = append(records, r)
+	}
+	return _hash_dataset("hashcat_pot", []string{"hash", "password"}, records), nil
+}
+
+func (h *_hashcat_pot) Render(ds *ir.Dataset) ([]byte, error) {
+	var b strings.Builder
+	for _, r := range ds.Records {
+		if r.Hash != nil {
+			b.WriteString(r.Hash.Value)
+			b.WriteByte(':')
+			b.WriteString(r.Password)
+			b.WriteByte('\n')
+		}
+	}
+	return []byte(b.String()), nil
 }
 
 func _hash_dataset(name string, cols []string, records []ir.Record) *ir.Dataset {
