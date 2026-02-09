@@ -6,7 +6,9 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/c137req/ptv/internal/api"
 	_ "github.com/c137req/ptv/internal/formats"
 	"github.com/c137req/ptv/internal/module"
 )
@@ -27,8 +29,73 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose output to stderr")
 	list_fmts := flag.Bool("formats", false, "list available formats")
 
+	// daemon / api flags
+	daemon := flag.String("daemon", "", "daemon control: start, stop, status")
+	bind := flag.String("bind", "0.0.0.0:0474", "api bind address")
+	random_port := flag.Bool("random-port", false, "pick a random available port")
+	api_key := flag.String("api-key", "", "api key (or PTV_API_KEY env; auto-generated if empty)")
+	max_body := flag.Int64("max-body", 10<<20, "maximum request body bytes")
+	rate_rpm := flag.Int("rate-limit", 60, "requests per minute per ip")
+	cors := flag.String("cors-origin", "", "allowed CORS origin")
+	tls_cert := flag.String("tls-cert", "", "tls certificate path")
+	tls_key := flag.String("tls-key", "", "tls private key path")
+	pid_file := flag.String("pid-file", "/tmp/ptv.pid", "daemon pid file path")
+	timeout := flag.Duration("timeout", 30*time.Second, "per-request timeout")
+
 	flag.Parse()
 	_verbose = *verbose
+
+	// daemon mode
+	if *daemon != "" {
+		// resolve api key: flag > env > auto-generate
+		key := *api_key
+		if key == "" {
+			key = os.Getenv("PTV_API_KEY")
+		}
+		if key == "" && *daemon == "start" {
+			generated, err := api.GenerateKey()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to generate api key: %v\n", err)
+				os.Exit(1)
+			}
+			key = generated
+			fmt.Fprintf(os.Stderr, "[ptv] generated api key: %s\n", key)
+		}
+
+		// handle random port
+		addr := *bind
+		if *random_port {
+			// replace port with 0 for OS assignment
+			parts := strings.Split(addr, ":")
+			if len(parts) >= 2 {
+				parts[len(parts)-1] = "0"
+				addr = strings.Join(parts, ":")
+			} else {
+				addr = addr + ":0"
+			}
+		}
+
+		switch *daemon {
+		case "start":
+			srv := api.NewServer(addr, key, *max_body, *rate_rpm, *cors,
+				*tls_cert, *tls_key, *timeout, _verbose, _log)
+			if err := api.DaemonStart(srv, *pid_file); err != nil {
+				fmt.Fprintf(os.Stderr, "daemon start failed: %v\n", err)
+				os.Exit(1)
+			}
+		case "stop":
+			if err := api.DaemonStop(*pid_file, _log); err != nil {
+				fmt.Fprintf(os.Stderr, "daemon stop failed: %v\n", err)
+				os.Exit(1)
+			}
+		case "status":
+			api.DaemonStatus(*pid_file, _log)
+		default:
+			fmt.Fprintf(os.Stderr, "unknown daemon command: %s (use start, stop, or status)\n", *daemon)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *list_fmts {
 		fmts := module.List()
@@ -42,6 +109,7 @@ func main() {
 	if *from == "" || *to == "" {
 		fmt.Fprintln(os.Stderr, "usage: ptv -from <format> -to <format> [-i input] [-o output] [-v]")
 		fmt.Fprintln(os.Stderr, "       ptv -formats")
+		fmt.Fprintln(os.Stderr, "       ptv -daemon <start|stop|status> [-bind addr] [-api-key key] [-v]")
 		os.Exit(1)
 	}
 

@@ -341,34 +341,116 @@ Each format has a **FROM** score (parsing from that format into IR) and a **TO**
 | 84 | Docker config.json | Registry auth with base64 credentials | Go | `encoding/json` | 8 | 8 |
 | 85 | AWS credentials / config | INI-style `~/.aws/credentials` | Go | `go-ini/ini` | 9 | 9 |
 
-### Go/Python Split
-
-Go handles the API server and most formats — especially text-based, JSON, CSV, XML, binary serialization, and crypto formats where Go's stdlib and ecosystem are strong.
-
-Python is used only where it has significantly better libraries:
-- SQL dump parsing (`sqlparse`)
-- Stealer log parsing (`stealer-parser` + existing custom parser)
-- Telegram log channel parsing — existing parser logic at `../../code/big money project/individual/start.py` (or `main.py`). parses security alerts from telegram log channels for anyone inside the logs. reuse parser logic instead of reimplementing
-- Password manager imports (`pass-import`)
-- Modular crypt format handling (`passlib`)
-- Windows Event Log parsing (`python-evtx`)
-- Redis RDB parsing (`redis-rdb-tools`)
-- Excel files (`openpyxl`)
-- Neo4j Cypher generation (`neo4j` driver)
-- LDIF handling (`python-ldap`)
-- macOS plist (`plistlib`)
-- Rainbow table handling (custom)
-- Kerberos/GPG (specialized bindings)
-
-Python modules are standalone scripts. Go calls them via `os/exec`, piping IR JSON over stdin/stdout. Errors go to stderr. Non-zero exit = failure. Stateless and debuggable.
-
 ### RESTful API
 
-A Go HTTP API will wrap the CLI conversion system. The core endpoints:
+The Go HTTP API wraps the same module registry and Parse/Render pipeline as the CLI — no separate logic, no external framework. All 83 formats are automatically available via path-based routing.
 
-```
-POST /convert       { "from": "<format>", "to": "<format>", "data": "..." }
-GET  /formats       list available format modules
+#### Daemon
+
+```bash
+ptv -daemon start [-v]              # start, auto-generates api key
+ptv -daemon start -api-key <key>    # start with explicit key
+ptv -daemon stop                    # graceful shutdown (30s drain)
+ptv -daemon status                  # check if running
 ```
 
-The API reuses the same module registry and Parse/Render pipeline as the CLI — no separate logic. Security implementation (authentication, rate limiting, access control, etc.) will be specified and instructed by the project owner before being built.
+The API key is resolved in order: `-api-key` flag → `PTV_API_KEY` env var → auto-generated (16 chars, mixed latin/cyrillic/digits). The generated key is printed to stderr on start.
+
+#### Routes
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/convert/{from}/{to}` | yes | convert data between formats |
+| `GET` | `/formats` | yes | list available format modules |
+| `GET` | `/health` | no | uptime and format count |
+| `GET` | `/metrics` | yes | request stats, per-format usage, latency |
+
+Format names are path variables — adding new format modules requires zero route changes.
+
+#### `POST /convert/{from}/{to}`
+
+Request:
+```json
+{"data": "<base64-encoded input>"}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "data": "<base64-encoded output>",
+  "meta": {
+    "source_format": "csv",
+    "target_format": "json_flat",
+    "record_count": 42,
+    "parsed_at": "2026-02-09T12:00:00Z"
+  }
+}
+```
+
+All data is base64-encoded because many formats are binary (parquet, bson, protobuf, etc.).
+
+#### Error responses
+
+```json
+{"ok": false, "error": {"code": "invalid_format", "message": "conversion failed"}}
+```
+
+Error codes: `bad_request`, `invalid_format`, `bad_data`, `empty_data`, `parse_error`, `render_error`, `rate_limited`, `unauthorised`, `internal_error`. Internal details are never exposed — logged to stderr with `-v` only.
+
+#### Configuration
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-daemon` | | daemon control: `start`, `stop`, `status` |
+| `-bind` | `0.0.0.0:0474` | api bind address |
+| `-random-port` | `false` | use OS-assigned random port |
+| `-api-key` | auto | api key (or `PTV_API_KEY` env var) |
+| `-max-body` | `10MB` | maximum request body size |
+| `-rate-limit` | `60` | requests per minute per ip |
+| `-cors-origin` | | allowed CORS origin (empty = disabled) |
+| `-tls-cert` | | TLS certificate path |
+| `-tls-key` | | TLS private key path |
+| `-pid-file` | `/tmp/ptv.pid` | daemon PID file path |
+| `-timeout` | `30s` | per-request processing timeout |
+
+#### Security
+
+**Internal-IP only** — requests are accepted only from private/loopback source IPs (`10.x`, `172.16-31.x`, `192.168.x`, `127.x`, `::1`). Checked via the actual TCP connection (`r.RemoteAddr`), never headers.
+
+**Constant-time auth** — API key comparison uses `crypto/subtle.ConstantTimeCompare` with length-padded inputs. No timing side-channels.
+
+**Anti-enumeration** — `POST /convert/{from}/{to}` returns identical errors for invalid format names and parse failures. Both source and target lookups always execute before checking either result.
+
+**Rate limiting** — per-IP sliding window (in-memory), configurable RPM. `X-Forwarded-For` is not trusted.
+
+**OOM prevention** — `http.MaxBytesReader` enforces body limit. Transport-level `ReadTimeout` (10s) and `ReadHeaderTimeout` (5s) prevent slowloris.
+
+**Hardened headers** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy: default-src 'none'`, `Cache-Control: no-store`.
+
+**Panic recovery** — panics in handlers produce generic 500 responses with no stack traces.
+
+#### Example
+
+```bash
+# start the daemon
+ptv -daemon start -v
+
+# convert csv to json (with the printed api key)
+DATA=$(base64 -w0 < input.csv)
+curl -X POST \
+  -H "X-API-Key: <key>" \
+  -H "Content-Type: application/json" \
+  -d "{\"data\":\"$DATA\"}" \
+  http://localhost:0474/convert/csv/json_flat \
+  | jq -r '.data' | base64 -d
+
+# list formats
+curl -H "X-API-Key: <key>" http://localhost:0474/formats
+
+# check metrics
+curl -H "X-API-Key: <key>" http://localhost:0474/metrics
+
+# stop
+ptv -daemon stop
+```
