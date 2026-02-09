@@ -1,6 +1,9 @@
 package formats
 
 import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
@@ -10,24 +13,28 @@ import (
 
 	"github.com/c137req/ptv/internal/ir"
 	"github.com/c137req/ptv/internal/module"
+	"software.sslmate.com/src/go-pkcs12"
 )
 
 type _x509_pem struct{}
 type _x509_der struct{}
 type _ssh_authorized_keys struct{}
 type _ssh_private_key struct{}
+type _pkcs12 struct{}
 
 func init() {
 	module.Register(&_x509_pem{})
 	module.Register(&_x509_der{})
 	module.Register(&_ssh_authorized_keys{})
 	module.Register(&_ssh_private_key{})
+	module.Register(&_pkcs12{})
 }
 
 func (x *_x509_pem) Name() string            { return "x509_pem" }
 func (x *_x509_der) Name() string            { return "x509_der" }
 func (s *_ssh_authorized_keys) Name() string  { return "ssh_authorized_keys" }
 func (s *_ssh_private_key) Name() string      { return "ssh_private_key" }
+func (p *_pkcs12) Name() string               { return "pkcs12" }
 
 // --- x509 pem ---
 
@@ -327,4 +334,82 @@ func (s *_ssh_private_key) Render(ds *ir.Dataset) ([]byte, error) {
 		b.Write(pem.EncodeToMemory(block))
 	}
 	return []byte(b.String()), nil
+}
+
+// --- pkcs12 ---
+
+func (p *_pkcs12) Parse(raw []byte) (*ir.Dataset, error) {
+	passwords := []string{"", "changeit", "password"}
+
+	var private_key any
+	var cert *x509.Certificate
+	var ca_certs []*x509.Certificate
+	var decoded bool
+
+	for _, pw := range passwords {
+		pk, c, cas, err := pkcs12.DecodeChain(raw, pw)
+		if err == nil {
+			private_key = pk
+			cert = c
+			ca_certs = cas
+			decoded = true
+			break
+		}
+	}
+
+	if !decoded {
+		return nil, fmt.Errorf("pkcs12: unable to decode (tried empty, 'changeit', 'password')")
+	}
+
+	var records []ir.Record
+
+	if cert != nil {
+		r := _cert_to_record(cert)
+		r.Extra["has_private_key"] = private_key != nil
+		if private_key != nil {
+			r.Extra["private_key_type"] = _key_type_name(private_key)
+		}
+		records = append(records, r)
+	}
+
+	for _, ca := range ca_certs {
+		r := _cert_to_record(ca)
+		r.Extra["is_ca"] = true
+		records = append(records, r)
+	}
+
+	cols := _detect_columns(records)
+	conf := map[string]float64{}
+	for _, c := range cols {
+		conf[c] = 1.0
+	}
+
+	return &ir.Dataset{
+		PTVVersion: "1.0",
+		Meta: ir.Meta{
+			SourceFormat:    "pkcs12",
+			ParsedAt:        time.Now().UTC().Format(time.RFC3339),
+			RecordCount:     len(records),
+			Columns:         cols,
+			FieldConfidence: conf,
+		},
+		Records: records,
+	}, nil
+}
+
+func (p *_pkcs12) Render(ds *ir.Dataset) ([]byte, error) {
+	return (&_x509_pem{}).Render(ds)
+}
+
+func _key_type_name(key any) string {
+	switch key.(type) {
+	case *rsa.PrivateKey:
+		return "RSA"
+	case *ecdsa.PrivateKey:
+		return "ECDSA"
+	case ed25519.PrivateKey:
+		return "Ed25519"
+	default:
+		return "unknown"
+	}
 }

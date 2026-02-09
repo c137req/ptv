@@ -14,16 +14,19 @@ import (
 type _firebase_json struct{}
 type _firestore_json struct{}
 type _couchdb_json struct{}
+type _dynamodb_json struct{}
 
 func init() {
 	module.Register(&_firebase_json{})
 	module.Register(&_firestore_json{})
 	module.Register(&_couchdb_json{})
+	module.Register(&_dynamodb_json{})
 }
 
 func (f *_firebase_json) Name() string  { return "firebase_json" }
 func (f *_firestore_json) Name() string { return "firestore_json" }
 func (c *_couchdb_json) Name() string   { return "couchdb_json" }
+func (d *_dynamodb_json) Name() string  { return "dynamodb_json" }
 
 // --- firebase json ---
 
@@ -370,5 +373,133 @@ func (c *_couchdb_json) Render(ds *ir.Dataset) ([]byte, error) {
 		docs = append(docs, m)
 	}
 	root := map[string]any{"docs": docs}
+	return json.MarshalIndent(root, "", "  ")
+}
+
+// --- dynamodb json ---
+
+func (d *_dynamodb_json) Parse(raw []byte) (*ir.Dataset, error) {
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, fmt.Errorf("failed to parse dynamodb json: %w", err)
+	}
+
+	var items []any
+	if arr, ok := root["Items"].([]any); ok {
+		items = arr
+	} else if arr, ok := root["items"].([]any); ok {
+		items = arr
+	}
+
+	if items == nil {
+		return nil, fmt.Errorf("dynamodb json: no Items array found")
+	}
+
+	var records []ir.Record
+	for _, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		r := ir.Record{PTVID: ir.NewPTVID()}
+		matched := 0
+		for k, v := range obj {
+			typed, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			val := _dynamodb_unwrap(typed)
+			if _map_field_to_record(&r, k, val) {
+				matched++
+			} else {
+				if r.Extra == nil {
+					r.Extra = map[string]any{}
+				}
+				r.Extra[k] = val
+			}
+		}
+		if matched > 0 {
+			records = append(records, r)
+		}
+	}
+
+	cols := _detect_columns(records)
+	conf := map[string]float64{}
+	for _, c := range cols {
+		conf[c] = 1.0
+	}
+
+	return &ir.Dataset{
+		PTVVersion: "1.0",
+		Meta: ir.Meta{
+			SourceFormat:    "dynamodb_json",
+			ParsedAt:        time.Now().UTC().Format(time.RFC3339),
+			RecordCount:     len(records),
+			Columns:         cols,
+			FieldConfidence: conf,
+		},
+		Records: records,
+	}, nil
+}
+
+func _dynamodb_unwrap(typed map[string]any) string {
+	for _, key := range []string{"S", "N", "BOOL", "NULL", "B"} {
+		if v, ok := typed[key]; ok {
+			return fmt.Sprintf("%v", v)
+		}
+	}
+	if list, ok := typed["L"].([]any); ok {
+		parts := make([]string, 0, len(list))
+		for _, item := range list {
+			if m, ok := item.(map[string]any); ok {
+				parts = append(parts, _dynamodb_unwrap(m))
+			}
+		}
+		return strings.Join(parts, ",")
+	}
+	if ss, ok := typed["SS"].([]any); ok {
+		parts := make([]string, 0, len(ss))
+		for _, s := range ss {
+			parts = append(parts, fmt.Sprintf("%v", s))
+		}
+		return strings.Join(parts, ",")
+	}
+	return fmt.Sprintf("%v", typed)
+}
+
+func (d *_dynamodb_json) Render(ds *ir.Dataset) ([]byte, error) {
+	items := make([]map[string]any, 0, len(ds.Records))
+	for _, r := range ds.Records {
+		item := map[string]any{}
+		if r.Email != "" {
+			item["email"] = map[string]string{"S": r.Email}
+		}
+		if r.Username != "" {
+			item["username"] = map[string]string{"S": r.Username}
+		}
+		if r.Password != "" {
+			item["password"] = map[string]string{"S": r.Password}
+		}
+		if r.URL != "" {
+			item["url"] = map[string]string{"S": r.URL}
+		}
+		if r.Domain != "" {
+			item["domain"] = map[string]string{"S": r.Domain}
+		}
+		if r.IP != "" {
+			item["ip"] = map[string]string{"S": r.IP}
+		}
+		if r.Phone != "" {
+			item["phone"] = map[string]string{"S": r.Phone}
+		}
+		if r.Name != "" {
+			item["name"] = map[string]string{"S": r.Name}
+		}
+		for k, v := range r.Extra {
+			item[k] = map[string]string{"S": fmt.Sprintf("%v", v)}
+		}
+		items = append(items, item)
+	}
+	root := map[string]any{"Items": items}
 	return json.MarshalIndent(root, "", "  ")
 }
