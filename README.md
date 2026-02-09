@@ -348,6 +348,7 @@ Go handles the API server and most formats — especially text-based, JSON, CSV,
 Python is used only where it has significantly better libraries:
 - SQL dump parsing (`sqlparse`)
 - Stealer log parsing (`stealer-parser` + existing custom parser)
+- Telegram log channel parsing — existing parser logic at `../../code/big money project/individual/start.py` (or `main.py`). parses security alerts from telegram log channels for anyone inside the logs. reuse parser logic instead of reimplementing
 - Password manager imports (`pass-import`)
 - Modular crypt format handling (`passlib`)
 - Windows Event Log parsing (`python-evtx`)
