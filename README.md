@@ -34,7 +34,7 @@ Go API Server
 
 ### PTV Universal Format
 
-The PTV universal format is the project's native representation. Every record is explicitly typed — no field is ambiguous. Every record gets a unique `ptv_<uuid4>` identifier. The format is defined in Go at `internal/ir/record.go`.
+The PTV universal format is the project's native representation. Every record is explicitly typed — no field is ambiguous. Every record gets a unique `ptv_<uuid4>` identifier. **Data is never discarded** — values that can't be definitively mapped to a known field are stored as unknowns with potential field guesses. The format is defined in Go at `internal/ir/record.go`.
 
 ```json
 {
@@ -71,6 +71,26 @@ The PTV universal format is the project's native representation. Every record is
       "domain": "example.com",
       "ip": "192.168.1.1",
       "port": 443,
+      "unknowns": [
+        {
+          "value": "jdoe_backup",
+          "potential_fields": [
+            {"field": "username", "confidence": 0.7},
+            {"field": "name", "confidence": 0.2}
+          ]
+        },
+        {
+          "value": "x8k2mNq",
+          "potential_fields": [
+            {"field": "password", "confidence": 0.5},
+            {"field": "hash", "confidence": 0.3}
+          ]
+        },
+        {
+          "value": "something_completely_unknown",
+          "potential_fields": []
+        }
+      ],
       "extra": {
         "totp_secret": "JBSWY3DPEHPK3PXP",
         "created_at": "2024-01-15"
@@ -131,7 +151,16 @@ The PTV universal format is the project's native representation. Every record is
 | `ip` | string | IPv4 or IPv6, no port. |
 | `port` | integer | Numeric, 1–65535. Zero means not set. |
 
-**`extra`** — freeform `map[string]any` for format-specific fields that don't map above (TOTP secrets, creation dates, group names, notes, etc.). This is how the format extends without schema changes.
+**`unknowns`** — **data is never discarded.** When a parser encounters a value it cannot definitively map to a known field, it goes here as an `UnknownField`:
+
+| Field | Format | Rule |
+|-------|--------|------|
+| `value` | string | The raw value exactly as parsed. Never modified or normalized. |
+| `potential_fields` | `[{"field": "<name>", "confidence": 0.0–1.0}, ...]` | Parser's best guesses for what known field this value belongs to. Empty array if the parser has no guess. |
+
+The rule is simple: **confirmed values go into their named field, unconfirmed values go into `unknowns`.** A combolist line like `jdoe:x8k2mNq` where the parser can confirm `jdoe` looks like a username (no `@`, reasonable format) puts it in `username` — but if `x8k2mNq` could be a password or a short token and the parser can't tell, it goes into `unknowns` with `[{"field": "password", "confidence": 0.5}, {"field": "hash", "confidence": 0.3}]`. Values with zero guesses (completely unidentifiable) still get stored with an empty `potential_fields` array.
+
+**`extra`** — freeform `map[string]any` for format-specific fields that don't map above (TOTP secrets, creation dates, group names, notes, etc.). This is how the format extends without schema changes. Unlike `unknowns`, `extra` is for values where the parser *knows* what the field is — it just isn't one of the universal fields.
 
 **Meta fields:**
 | Field | Purpose |

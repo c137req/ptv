@@ -57,29 +57,54 @@ type Salt struct {
 	Encoding SaltEncoding `json:"encoding"`
 }
 
-// Record is a single entry in the PTV universal format. Every field is
-// explicitly typed and normalized — there is no ambiguity about what any
-// value represents.
+// PotentialField represents a best-guess mapping for an unknown value.
+// Field is the name of the Record field it might belong to (e.g. "email",
+// "username", "password", "hash"). Confidence is 0.0–1.0.
+type PotentialField struct {
+	Field      string  `json:"field"`
+	Confidence float64 `json:"confidence"`
+}
+
+// UnknownField holds a value that the parser could not definitively map to a
+// known Record field. The raw value is preserved as-is, and PotentialFields
+// lists the parser's best guesses for what the value represents.
+//
+// Rules:
+//   - If a value CAN be confirmed as a specific field, it goes into that field on Record.
+//   - If a value CANNOT be confirmed, it goes here. Never discard data.
+//   - PotentialFields may be empty if the parser has no guess at all.
+type UnknownField struct {
+	Value           string           `json:"value"`
+	PotentialFields []PotentialField `json:"potential_fields,omitempty"`
+}
+
+// Record is a single entry in the PTV universal format. Known fields are only
+// populated when the parser is confident about the mapping. Anything ambiguous
+// goes into Unknowns — data is never discarded.
 type Record struct {
 	// PTV ID — universal identifier, format: ptv_<uuid4>
 	PTVID string `json:"ptv_id"`
 
-	// Identity
+	// Identity (only set when confirmed)
 	Email    string `json:"email,omitempty"`
 	Username string `json:"username,omitempty"`
-	Phone    string `json:"phone,omitempty"`    // normalized: +<digits> only, e.g. +10000000000
+	Phone    string `json:"phone,omitempty"` // normalized: +<digits> only, e.g. +10000000000
 	Name     string `json:"name,omitempty"`
 
-	// Credentials
+	// Credentials (only set when confirmed)
 	Password string `json:"password,omitempty"` // plaintext, if known
 	Hash     *Hash  `json:"hash,omitempty"`
 	Salt     *Salt  `json:"salt,omitempty"`
 
-	// Network / source
+	// Network / source (only set when confirmed)
 	URL    string `json:"url,omitempty"`
 	Domain string `json:"domain,omitempty"`
 	IP     string `json:"ip,omitempty"`
 	Port   int    `json:"port,omitempty"`
+
+	// Values the parser couldn't definitively map to a known field.
+	// Never empty when the source had data the parser couldn't classify.
+	Unknowns []UnknownField `json:"unknowns,omitempty"`
 
 	// Catch-all for format-specific fields that don't map above
 	Extra map[string]any `json:"extra,omitempty"`
