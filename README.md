@@ -1,442 +1,65 @@
 # ptv
-Parse The Veil is a universal data parsing RESTful API. i love ptv
 
-## Plan
-
-### Architecture
-
-Hub-and-spoke model — every format module converts TO and FROM a common **Intermediate Representation (IR)**. Any-to-any conversion works like this:
+parse the veil — universal data format conversion tool. converts between 83 data formats through a common intermediate representation.
 
 ```
-Source.Parse(raw) → IR → Target.Render(ir)
+source.Parse(raw) → IR → target.Render(ir)
 ```
 
-- Go is the primary API server
-- Python modules are called via subprocess (JSON over stdin/stdout) only when Python has significantly better library support
-- Each module exposes exactly two operations: **Parse** (from that format → IR) and **Render** (IR → that format)
+any format can convert to any other format. add a new module and it automatically works with all existing ones.
 
-```
-┌─────────────┐     ┌─────────┐     ┌──────────────┐
-│ Input (any   │────▶│  Module  │────▶│     IR       │
-│ of 85 fmts)  │     │ .Parse() │     │ (common JSON)│
-└─────────────┘     └─────────┘     └──────┬───────┘
-                                           │
-                                           ▼
-                                    ┌─────────┐     ┌──────────────┐
-                                    │  Module  │────▶│ Output (any  │
-                                    │ .Render()│     │ of 85 fmts)  │
-                                    └─────────┘     └──────────────┘
+## install
 
-Go API Server
-├── Go modules    → direct function calls (fast)
-└── Python modules → subprocess, JSON over stdin/stdout
-```
-
-### PTV Universal Format
-
-The PTV universal format is the project's native representation. Every record is explicitly typed — no field is ambiguous. Every record gets a unique `ptv_<uuid4>` identifier. **Data is never discarded** — values that can't be definitively mapped to a known field are stored as unknowns with potential field guesses. The format is defined in Go at `internal/ir/record.go`.
-
-```json
-{
-  "ptv_version": "1.0",
-  "meta": {
-    "source_format": "combolist_user_pass",
-    "source_file": "dump.txt",
-    "parsed_at": "2026-02-09T12:00:00Z",
-    "record_count": 2,
-    "columns": ["email", "password"],
-    "field_confidence": {
-      "email": 0.95,
-      "username": 0.60,
-      "password": 1.0
-    }
-  },
-  "records": [
-    {
-      "ptv_id": "ptv_550e8400-e29b-41d4-a716-446655440000",
-      "email": "user@example.com",
-      "username": "someuser",
-      "phone": "+15555550100",
-      "name": "John Doe",
-      "password": "plaintext_if_known",
-      "hash": {
-        "type": "bcrypt",
-        "value": "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
-      },
-      "salt": {
-        "value": "abcdef1234567890",
-        "encoding": "hex"
-      },
-      "url": "https://example.com/login",
-      "domain": "example.com",
-      "ip": "192.168.1.1",
-      "port": 443,
-      "unknowns": [
-        {
-          "value": "jdoe_backup",
-          "potential_fields": [
-            {"field": "username", "confidence": 0.7},
-            {"field": "name", "confidence": 0.2}
-          ]
-        },
-        {
-          "value": "x8k2mNq",
-          "potential_fields": [
-            {"field": "password", "confidence": 0.5},
-            {"field": "hash", "confidence": 0.3}
-          ]
-        },
-        {
-          "value": "something_completely_unknown",
-          "potential_fields": []
-        }
-      ],
-      "extra": {
-        "totp_secret": "JBSWY3DPEHPK3PXP",
-        "created_at": "2024-01-15"
-      }
-    }
-  ]
-}
-```
-
-#### Field rules
-
-**`ptv_id`** — every record gets `ptv_<uuid4>`. Generated on parse, persists through conversions. This is the universal record identifier across all PTV operations.
-
-**Identity fields:**
-| Field | Format | Rule |
-|-------|--------|------|
-| `email` | RFC 5322 | Must contain `@`. Only set when the parser is confident the value is an email. |
-| `username` | string | No `@` allowed. If the source is ambiguous (could be email or username), parsers should use `email` if it contains `@`, `username` otherwise. |
-| `phone` | `+<digits>` | **No spaces, dashes, parentheses, or symbols except the leading `+`.** Raw input like `(555) 555-0100` gets normalized to `+15555550100`. |
-| `name` | string | Display name / full name if available. |
-
-**Credential fields:**
-| Field | Format | Rule |
-|-------|--------|------|
-| `password` | string | Plaintext password, if known. |
-| `hash` | `{"type": "<algo>", "value": "<string>"}` | Hash value with its identified algorithm type. See hash types below. |
-| `salt` | `{"value": "<string>", "encoding": "<hex\|base64\|utf8\|raw>"}` | Salt with its encoding explicitly declared. |
-
-**Hash types** (auto-detected by `DetectHashType()`):
-
-| Type | Identified by |
-|------|---------------|
-| `bcrypt` | `$2a$`, `$2b$`, `$2y$` prefix |
-| `argon2id` | `$argon2id$` prefix |
-| `argon2i` | `$argon2i$` prefix |
-| `scrypt` | `$scrypt$` prefix |
-| `pbkdf2` | `$pbkdf2` prefix |
-| `sha512crypt` | `$6$` prefix |
-| `sha256crypt` | `$5$` prefix |
-| `md5crypt` | `$1$` prefix |
-| `apr1` | `$apr1$` prefix |
-| `sha1crypt` | `$sha1$` prefix |
-| `mysql` | `*` + 40 hex chars |
-| `md5` | 32 hex chars |
-| `sha1` | 40 hex chars |
-| `sha224` | 56 hex chars |
-| `sha256` | 64 hex chars |
-| `sha384` | 96 hex chars |
-| `sha512` | 128 hex chars |
-| `ntlm` | 32 hex chars (context-dependent, same length as MD5) |
-| `unknown` | Anything that doesn't match the above patterns |
-
-**Network fields:**
-| Field | Format | Rule |
-|-------|--------|------|
-| `url` | string | Full URL if available. |
-| `domain` | string | Domain extracted from URL, or standalone. |
-| `ip` | string | IPv4 or IPv6, no port. |
-| `port` | integer | Numeric, 1–65535. Zero means not set. |
-
-**`unknowns`** — **data is never discarded.** When a parser encounters a value it cannot definitively map to a known field, it goes here as an `UnknownField`:
-
-| Field | Format | Rule |
-|-------|--------|------|
-| `value` | string | The raw value exactly as parsed. Never modified or normalized. |
-| `potential_fields` | `[{"field": "<name>", "confidence": 0.0–1.0}, ...]` | Parser's best guesses for what known field this value belongs to. Empty array if the parser has no guess. |
-
-The rule is simple: **confirmed values go into their named field, unconfirmed values go into `unknowns`.** A combolist line like `jdoe:x8k2mNq` where the parser can confirm `jdoe` looks like a username (no `@`, reasonable format) puts it in `username` — but if `x8k2mNq` could be a password or a short token and the parser can't tell, it goes into `unknowns` with `[{"field": "password", "confidence": 0.5}, {"field": "hash", "confidence": 0.3}]`. Values with zero guesses (completely unidentifiable) still get stored with an empty `potential_fields` array.
-
-**`extra`** — freeform `map[string]any` for format-specific fields that don't map above (TOTP secrets, creation dates, group names, notes, etc.). This is how the format extends without schema changes. Unlike `unknowns`, `extra` is for values where the parser *knows* what the field is — it just isn't one of the universal fields.
-
-**Meta fields:**
-| Field | Purpose |
-|-------|---------|
-| `source_format` | Module name that produced this dataset. |
-| `source_file` | Original filename, if known. |
-| `parsed_at` | ISO 8601 timestamp of when parsing occurred. |
-| `record_count` | Number of records in the dataset. |
-| `columns` | Which Record fields actually have data (e.g., a combolist only populates `email` + `password`). |
-| `field_confidence` | Per-field map of 0.0–1.0 indicating parser confidence. A CSV with explicit headers reports `1.0` for all mapped fields. A combolist parser that can't distinguish email vs username might report `{"email": 0.9, "username": 0.6}`. |
-
-### Easibility Scores
-
-Each format has a **FROM** score (parsing from that format into IR) and a **TO** score (rendering IR into that format), rated out of 10:
-
-| Range | Meaning |
-|-------|---------|
-| **9–10** | Trivial — stdlib or single-function calls, near-zero ambiguity |
-| **7–8** | Straightforward — good library support, minor edge cases |
-| **5–6** | Moderate — needs dialect handling, schema knowledge, or limited libraries |
-| **3–4** | Difficult — complex/binary formats, sparse library support |
-| **1–2** | Very hard — proprietary/undocumented, or requires external tooling |
-
-### Format Modules (85 total)
-
-#### Credential & Text Formats
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 1 | Plain Text (one-per-line) | Single field per line (passwords, emails, etc.) | Go | stdlib | 9 | 10 |
-| 2 | Combolist (user:pass) | Colon-delimited two-field credential pairs | Go | stdlib | 9 | 10 |
-| 3 | Combolist (email:pass) | Email-specific variant of #2 | Go | stdlib | 9 | 10 |
-| 4 | Combolist (user:pass:url) | Three-field extended combo with URL | Go | stdlib | 8 | 9 |
-| 5 | Combolist (user:pass:url:extra) | Variable-field extended combo | Go | stdlib | 7 | 8 |
-| 6 | Stealer Logs | Directory-structured browser credential dumps (Autofills, Cookies, Passwords) | Python | `stealer-parser`, existing parser | 4 | 3 |
-| 7 | /etc/shadow | Unix shadow password file (`user:$algo$salt$hash:...`) | Go | stdlib | 8 | 7 |
-| 8 | /etc/passwd | Unix password file (colon-delimited, 7 fields) | Go | stdlib | 9 | 8 |
-| 9 | htpasswd | Apache `username:hash` with bcrypt/MD5/SHA1 variants | Go | `tg123/go-htpasswd` | 8 | 8 |
-| 10 | Base64 Encoded Credentials | Base64-wrapped `user:pass` (HTTP Basic Auth style) | Go | `encoding/base64` | 10 | 10 |
-
-#### Hash & Cracking Formats
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 11 | Hash List (hash-only) | One hash per line, any algorithm | Go | stdlib | 8 | 9 |
-| 12 | Hash List (user:hash) | Username paired with hash | Go | stdlib | 8 | 9 |
-| 13 | Hash List (hash:salt) | Hash with explicit salt field | Go | stdlib | 7 | 8 |
-| 14 | Modular Crypt Format | `$algo$params$salt$hash` (bcrypt, scrypt, argon2, etc.) | Python | `passlib` | 6 | 7 |
-| 15 | John the Ripper POT | Cracked results: `hash:plaintext` | Go | stdlib | 9 | 9 |
-| 16 | Hashcat POT / Output | Cracked results with optional mode prefix | Go | stdlib | 8 | 8 |
-| 17 | Rainbow Tables (Ophcrack/RainbowCrack) | Pre-computed hash chain tables (.rt, .tbl) | Python | custom | 4 | 3 |
-
-#### Tabular & Structured Data
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 18 | CSV | Comma-separated values with header row | Go | `encoding/csv` | 10 | 10 |
-| 19 | TSV | Tab-separated values | Go | `encoding/csv` (tab delimiter) | 10 | 10 |
-| 20 | JSON (flat records) | Array of uniform objects | Go | `encoding/json` | 10 | 10 |
-| 21 | JSON (nested/app-specific) | Schema-specific JSON (needs field mapping) | Go | `encoding/json` | 7 | 7 |
-| 22 | XML (generic) | Arbitrary XML with credential-like elements | Go | `encoding/xml` | 7 | 7 |
-| 23 | YAML | YAML documents/lists | Go | `gopkg.in/yaml.v3` | 9 | 9 |
-| 24 | Excel (XLSX) | Spreadsheet with header row | Python | `openpyxl` | 6 | 6 |
-
-#### SQL & Relational Database Dumps
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 25 | SQL Dump — MySQL | DDL + INSERT statements, MySQL dialect | Python | `sqlparse` | 5 | 6 |
-| 26 | SQL Dump — PostgreSQL | DDL + COPY/INSERT, PostgreSQL dialect | Python | `sqlparse` | 4 | 5 |
-| 27 | SQL Dump — SQLite | Simpler SQL dialect, single-file DB | Go | `database/sql`, `modernc.org/sqlite` | 7 | 7 |
-| 28 | SQL Dump — MSSQL | T-SQL dialect, complex syntax | Python | `sqlparse` | 4 | 4 |
-| 29 | SQL Dump — Oracle | PL/SQL dialect | Python | `sqlparse` | 3 | 4 |
-
-#### NoSQL & Modern Database Formats
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 30 | BSON (MongoDB binary) | MongoDB's binary JSON serialization | Go | `go.mongodb.org/mongo-driver/bson` | 7 | 7 |
-| 31 | MongoDB mongodump | Directory of .bson files with metadata | Go | `go.mongodb.org/mongo-driver` | 6 | 6 |
-| 32 | Redis RDB | Binary point-in-time snapshot | Python | `redis-rdb-tools` | 5 | 5 |
-| 33 | Redis AOF | Append-only text log of write ops | Go | stdlib (Redis protocol parsing) | 8 | 8 |
-| 34 | Neo4j Cypher Script | CREATE/MERGE statements for graph data | Python | `neo4j` driver | 5 | 6 |
-| 35 | DynamoDB JSON | AWS DynamoDB export with typed values | Go | `aws-sdk-go-v2` | 7 | 7 |
-| 36 | InfluxDB Line Protocol | `measurement,tags fields timestamp` | Go | stdlib (text parsing) | 8 | 8 |
-| 37 | Firebase Realtime DB JSON | Nested JSON tree export | Go | `encoding/json` | 9 | 9 |
-| 38 | Firestore JSON/JSONL | Flat or nested document exports | Go | `encoding/json` | 9 | 8 |
-| 39 | CouchDB/Couchbase JSON | JSON document exports | Go | `encoding/json` | 9 | 9 |
-| 40 | Cassandra CQL COPY | CSV-like CQL export format | Go | `encoding/csv` | 8 | 8 |
-
-#### Password Manager Exports
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 41 | KeePass XML Export | KeePass 2.x XML export format | Python | `pass-import` | 7 | 5 |
-| 42 | LastPass CSV Export | CSV with `url,username,password,totp,extra,name,grouping,fav` | Go | `encoding/csv` | 9 | 9 |
-| 43 | 1Password CSV Export | CSV with 1Password-specific headers | Go | `encoding/csv` | 9 | 8 |
-| 44 | Bitwarden JSON Export | JSON with folders, items, login objects | Go | `encoding/json` | 8 | 7 |
-| 45 | Bitwarden CSV Export | Flattened CSV variant | Go | `encoding/csv` | 9 | 9 |
-| 46 | Chrome CSV Export | `name,url,username,password` | Go | `encoding/csv` | 9 | 9 |
-
-#### Browser & Cookie Formats
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 47 | Firefox JSON Export | JSON with Mozilla-specific fields (httpRealm, formActionOrigin, etc.) | Go | `encoding/json` | 8 | 7 |
-| 48 | Netscape Cookie Format | Tab-separated cookie file (curl/wget/browser compatible) | Go | `aki237/nscjar` | 7 | 7 |
-| 49 | Safari CSV Export | Apple's CSV credential export | Go | `encoding/csv` | 9 | 9 |
-| 50 | Browser SQLite DB | Chrome/Firefox credential SQLite databases | Go | `modernc.org/sqlite` | 7 | 6 |
-
-#### Directory & Identity Formats
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 51 | LDIF (LDAP) | LDAP Data Interchange Format (RFC 2849) | Python | `python-ldap`, `ldif` | 5 | 5 |
-| 52 | vCard (VCF) | Contact card format with potential credential metadata | Go | `emersion/go-vcard` | 7 | 7 |
-
-#### Configuration File Formats
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 53 | TOML | Tom's Obvious Minimal Language | Go | `BurntSushi/toml` | 9 | 9 |
-| 54 | INI / .properties / .conf | Key=value config with optional sections | Go | `go-ini/ini` | 9 | 9 |
-| 55 | HCL (HashiCorp) | Terraform/Vault config language | Go | `hashicorp/hcl/v2` | 7 | 7 |
-| 56 | macOS plist | Apple property list (XML or binary) | Python | `plistlib` (stdlib) | 8 | 8 |
-| 57 | .env | `KEY=VALUE` environment variable files | Go | stdlib | 9 | 10 |
-
-#### Serialization & Binary Formats
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 58 | MessagePack | Efficient binary JSON-like serialization | Go | `vmihailenco/msgpack` | 8 | 8 |
-| 59 | CBOR | Concise Binary Object Representation (RFC 8949) | Go | `fxamacker/cbor/v2` | 7 | 7 |
-| 60 | Protocol Buffers | Schema-driven binary serialization | Go | `google.golang.org/protobuf` | 6 | 6 |
-| 61 | Apache Avro | Schema-embedded binary format, data lake standard | Python | `fastavro` | 6 | 7 |
-| 62 | Apache Parquet | Columnar storage, big data standard | Python | `pyarrow` | 5 | 5 |
-| 63 | Apache Thrift | Facebook RPC serialization | Go | `apache/thrift` | 6 | 6 |
-| 64 | FlatBuffers | Google zero-copy serialization | Go | `google/flatbuffers` | 6 | 6 |
-| 65 | Bencode (BitTorrent) | BitTorrent metainfo encoding | Go | `anacrolix/torrent` | 7 | 7 |
-
-#### Auth & Cryptographic Formats
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 66 | JWT (JSON Web Token) | `header.payload.signature` (Base64URL) | Go | `golang-jwt/jwt` | 9 | 9 |
-| 67 | X.509 Certificate (PEM) | Base64-encoded DER with text headers | Go | `crypto/x509` | 8 | 8 |
-| 68 | X.509 Certificate (DER) | Raw binary ASN.1 encoding | Go | `crypto/x509` | 7 | 7 |
-| 69 | PKCS#12 (.p12/.pfx) | Binary cert + private key container | Go | `crypto/x509` | 6 | 6 |
-| 70 | SSH authorized_keys | One public key per line | Go | `crypto/ssh` | 8 | 8 |
-| 71 | SSH Private Key (PEM) | PEM-wrapped private key | Go | `crypto/ssh` | 7 | 7 |
-| 72 | Kerberos Keytab | Binary credential file for Kerberos principals | Python | MIT krb5 bindings | 5 | 4 |
-| 73 | GPG/PGP Keyring | Exported ASCII-armored or binary keys | Python | `python-gnupg` | 4 | 3 |
-| 74 | Ethereum Keystore (UTC/JSON) | Encrypted wallet JSON with Scrypt KDF | Go | `go-ethereum` | 7 | 7 |
-
-#### Log Formats
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 75 | Syslog (RFC 5424) | Standardized system log format | Go | stdlib | 8 | 9 |
-| 76 | Apache/Nginx Access Log | Common/Combined log format | Go | stdlib (regex) | 8 | 9 |
-| 77 | Windows Event Log (EVTX) | Binary XML event log | Python | `python-evtx` | 6 | 3 |
-| 78 | journald (systemd) | Binary journal entries | Python | `systemd` bindings | 6 | 4 |
-
-#### Network & VPN Config
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 79 | OpenVPN (.ovpn) | OpenVPN client config with embedded certs/keys | Go | stdlib (text parsing) | 8 | 9 |
-| 80 | WireGuard (.conf) | INI-like peer/interface config | Go | stdlib | 9 | 9 |
-| 81 | Windows WiFi Profile (XML) | Windows WLAN XML with optional plaintext keys | Go | `encoding/xml` | 8 | 8 |
-
-#### Application & Platform Exports
-
-| # | Format | Description | Lang | Key Libraries | FROM | TO |
-|---|--------|-------------|------|---------------|------|----|
-| 82 | Telegram JSON Export | Chat history as JSON | Go | `encoding/json` | 8 | 8 |
-| 83 | Discord Data Package | GDPR export with messages as JSON | Go | `encoding/json` | 8 | 8 |
-| 84 | Docker config.json | Registry auth with base64 credentials | Go | `encoding/json` | 8 | 8 |
-| 85 | AWS credentials / config | INI-style `~/.aws/credentials` | Go | `go-ini/ini` | 9 | 9 |
-
-### RESTful API
-
-The Go HTTP API wraps the same module registry and Parse/Render pipeline as the CLI — no separate logic, no external framework. All 83 formats are automatically available via path-based routing.
-
-#### Daemon
+requires go 1.22 or later.
 
 ```bash
-ptv -daemon start [-v]              # start, auto-generates api key
-ptv -daemon start -api-key <key>    # start with explicit key
-ptv -daemon stop                    # graceful shutdown (30s drain)
-ptv -daemon status                  # check if running
+go install github.com/c137req/ptv@latest
 ```
 
-The API key is resolved in order: `-api-key` flag → `PTV_API_KEY` env var → auto-generated (16 chars, mixed latin/cyrillic/digits). The generated key is printed to stderr on start.
-
-#### Routes
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `POST` | `/convert/{from}/{to}` | yes | convert data between formats |
-| `GET` | `/formats` | yes | list available format modules |
-| `GET` | `/health` | no | uptime and format count |
-| `GET` | `/metrics` | yes | request stats, per-format usage, latency |
-
-Format names are path variables — adding new format modules requires zero route changes.
-
-#### `POST /convert/{from}/{to}`
-
-Request:
-```json
-{"data": "<base64-encoded input>"}
-```
-
-Response:
-```json
-{
-  "ok": true,
-  "data": "<base64-encoded output>",
-  "meta": {
-    "source_format": "csv",
-    "target_format": "json_flat",
-    "record_count": 42,
-    "parsed_at": "2026-02-09T12:00:00Z"
-  }
-}
-```
-
-All data is base64-encoded because many formats are binary (parquet, bson, protobuf, etc.).
-
-#### Error responses
-
-```json
-{"ok": false, "error": {"code": "invalid_format", "message": "conversion failed"}}
-```
-
-Error codes: `bad_request`, `invalid_format`, `bad_data`, `empty_data`, `parse_error`, `render_error`, `rate_limited`, `unauthorised`, `internal_error`. Internal details are never exposed — logged to stderr with `-v` only.
-
-#### Configuration
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-daemon` | | daemon control: `start`, `stop`, `status` |
-| `-bind` | `0.0.0.0:0474` | api bind address |
-| `-random-port` | `false` | use OS-assigned random port |
-| `-api-key` | auto | api key (or `PTV_API_KEY` env var) |
-| `-max-body` | `10MB` | maximum request body size |
-| `-rate-limit` | `60` | requests per minute per ip |
-| `-cors-origin` | | allowed CORS origin (empty = disabled) |
-| `-tls-cert` | | TLS certificate path |
-| `-tls-key` | | TLS private key path |
-| `-pid-file` | `/tmp/ptv.pid` | daemon PID file path |
-| `-timeout` | `30s` | per-request processing timeout |
-
-#### Security
-
-**Internal-IP only** — requests are accepted only from private/loopback source IPs (`10.x`, `172.16-31.x`, `192.168.x`, `127.x`, `::1`). Checked via the actual TCP connection (`r.RemoteAddr`), never headers.
-
-**Constant-time auth** — API key comparison uses `crypto/subtle.ConstantTimeCompare` with length-padded inputs. No timing side-channels.
-
-**Anti-enumeration** — `POST /convert/{from}/{to}` returns identical errors for invalid format names and parse failures. Both source and target lookups always execute before checking either result.
-
-**Rate limiting** — per-IP sliding window (in-memory), configurable RPM. `X-Forwarded-For` is not trusted.
-
-**OOM prevention** — `http.MaxBytesReader` enforces body limit. Transport-level `ReadTimeout` (10s) and `ReadHeaderTimeout` (5s) prevent slowloris.
-
-**Hardened headers** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Content-Security-Policy: default-src 'none'`, `Cache-Control: no-store`.
-
-**Panic recovery** — panics in handlers produce generic 500 responses with no stack traces.
-
-#### Example
+or build from source:
 
 ```bash
-# start the daemon
+git clone git@github.com:c137req/ptv.git
+cd ptv
+go build .
+```
+
+## usage
+
+### cli
+
+```bash
+# convert csv to json
+ptv -from csv -to json_flat -i data.csv -o output.json
+
+# pipe through stdin/stdout
+cat data.csv | ptv -from csv -to json_flat > output.json
+
+# convert with verbose logging
+ptv -from shadow -to csv -i /etc/shadow -o - -v
+
+# list all available formats
+ptv -formats
+```
+
+### api server
+
+ptv includes a built-in http api server with daemon management. see the [api documentation](WIKI.md) for full details.
+
+```bash
+# start the api server
 ptv -daemon start -v
 
-# convert csv to json (with the printed api key)
+# stop the server
+ptv -daemon stop
+
+# check if running
+ptv -daemon status
+```
+
+quick conversion via the api:
+
+```bash
 DATA=$(base64 -w0 < input.csv)
 curl -X POST \
   -H "X-API-Key: <key>" \
@@ -444,13 +67,163 @@ curl -X POST \
   -d "{\"data\":\"$DATA\"}" \
   http://localhost:0474/convert/csv/json_flat \
   | jq -r '.data' | base64 -d
-
-# list formats
-curl -H "X-API-Key: <key>" http://localhost:0474/formats
-
-# check metrics
-curl -H "X-API-Key: <key>" http://localhost:0474/metrics
-
-# stop
-ptv -daemon stop
 ```
+
+## supported formats
+
+83 formats across 14 categories.
+
+### credentials & text
+| format | description |
+|--------|-------------|
+| `plaintext` | single field per line |
+| `combolist_user_pass` | `user:pass` pairs |
+| `combolist_email_pass` | `email:pass` pairs |
+| `combolist_user_pass_url` | `user:pass:url` triples |
+| `combolist_extended` | variable-field combos |
+| `stealer_logs` | browser credential dumps (redline/racoon) |
+| `shadow` | unix `/etc/shadow` |
+| `passwd` | unix `/etc/passwd` |
+| `htpasswd` | apache `user:hash` |
+| `base64_creds` | base64 `user:pass` (http basic auth) |
+
+### hashes & cracking
+| format | description |
+|--------|-------------|
+| `hashlist_plain` | one hash per line |
+| `hashlist_user_hash` | `user:hash` pairs |
+| `hashlist_hash_salt` | `hash:salt` pairs |
+| `modular_crypt` | `$algo$params$salt$hash` |
+| `jtr_pot` | john the ripper cracked results |
+| `hashcat_pot` | hashcat cracked results |
+| `rainbow_table` | pre-computed hash chains |
+
+### tabular & structured
+| format | description |
+|--------|-------------|
+| `csv` | comma-separated values |
+| `tsv` | tab-separated values |
+| `json_flat` | flat json array of objects |
+| `json_nested` | nested/app-specific json |
+| `xml_generic` | arbitrary xml |
+| `yaml` | yaml documents |
+| `excel` | xlsx spreadsheets |
+
+### sql dumps
+| format | description |
+|--------|-------------|
+| `sql_dump_mysql` | mysql dialect |
+| `sql_dump_postgres` | postgresql dialect |
+| `sql_dump_mssql` | mssql/t-sql dialect |
+| `sql_dump_oracle` | oracle/pl-sql dialect |
+| `sqlite` | sqlite databases |
+
+### nosql & modern databases
+| format | description |
+|--------|-------------|
+| `bson` | mongodb binary json |
+| `redis_rdb` | redis binary snapshot |
+| `redis_aof` | redis append-only log |
+| `neo4j_cypher` | cypher create/merge statements |
+| `dynamodb_json` | aws dynamodb typed export |
+| `influxdb_lp` | influxdb line protocol |
+| `firebase_json` | firebase realtime db export |
+| `firestore_json` | firestore document export |
+| `couchdb_json` | couchdb document export |
+| `cassandra_cql` | cassandra cql copy format |
+
+### password managers
+| format | description |
+|--------|-------------|
+| `keepass_xml` | keepass 2.x xml export |
+| `lastpass_csv` | lastpass csv export |
+| `onepassword_csv` | 1password csv export |
+| `bitwarden_json` | bitwarden json export |
+| `bitwarden_csv` | bitwarden csv export |
+| `chrome_csv` | chrome password export |
+
+### browsers & cookies
+| format | description |
+|--------|-------------|
+| `firefox_json` | firefox json export |
+| `netscape_cookie` | netscape cookie format |
+| `safari_csv` | safari csv export |
+| `browser_sqlite` | chrome/firefox sqlite dbs |
+
+### directory & identity
+| format | description |
+|--------|-------------|
+| `ldif` | ldap data interchange format |
+| `vcard` | vcard contact format |
+
+### configuration files
+| format | description |
+|--------|-------------|
+| `toml` | toml config |
+| `ini` | ini/properties/conf |
+| `hcl` | hashicorp config language |
+| `plist` | macos property list |
+| `env` | `.env` key=value files |
+
+### serialisation & binary
+| format | description |
+|--------|-------------|
+| `msgpack` | messagepack binary |
+| `cbor` | concise binary object representation |
+| `protobuf` | protocol buffers (schema-less) |
+| `avro` | apache avro |
+| `parquet` | apache parquet |
+| `thrift` | apache thrift binary |
+| `bencode` | bittorrent encoding |
+
+### auth & cryptography
+| format | description |
+|--------|-------------|
+| `jwt` | json web tokens |
+| `x509_pem` | pem-encoded certificates |
+| `x509_der` | der-encoded certificates |
+| `pkcs12` | pkcs#12 containers |
+| `ssh_authorized_keys` | ssh public keys |
+| `ssh_private_key` | ssh private keys |
+| `kerberos_keytab` | kerberos keytab files |
+| `gpg_keyring` | gpg/pgp keyrings |
+| `ethereum_keystore` | ethereum wallet json |
+
+### logs
+| format | description |
+|--------|-------------|
+| `syslog` | rfc 5424 syslog |
+| `access_log` | apache/nginx access logs |
+| `evtx` | windows event logs |
+| `journald` | systemd journal |
+
+### network & vpn
+| format | description |
+|--------|-------------|
+| `openvpn` | openvpn client config |
+| `wireguard` | wireguard config |
+| `windows_wifi_xml` | windows wifi profiles |
+
+### applications
+| format | description |
+|--------|-------------|
+| `telegram_json` | telegram chat export |
+| `discord_json` | discord data package |
+| `docker_config` | docker registry auth |
+| `aws_credentials` | aws credentials/config |
+
+## intermediate representation
+
+every record passes through a common IR with typed fields:
+
+- **identity**: email, username, phone, name
+- **credentials**: password, hash (type + value), salt (value + encoding)
+- **network**: url, domain, ip, port
+- **unknowns**: values the parser couldn't definitively classify, stored with confidence scores
+- **extra**: format-specific fields that don't fit the universal schema
+
+data is never discarded — anything that can't be mapped to a known field goes into unknowns with the parser's best guess at what it might be.
+
+## licence
+
+MIT
